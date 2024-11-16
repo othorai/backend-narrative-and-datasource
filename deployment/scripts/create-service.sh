@@ -6,6 +6,15 @@ set -e  # Exit on error
 source deployment/scripts/load-env.sh
 load_env
 
+# Register new task definition
+echo "Registering new task definition..."
+TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+    --cli-input-json file://deployment/ecs/task-definition.json \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
+echo "Task definition registered: $TASK_DEFINITION_ARN"
+
 echo "Creating ECS service..."
 aws ecs create-service \
     --cluster $CLUSTER_NAME \
