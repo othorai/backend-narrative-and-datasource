@@ -1,5 +1,5 @@
-#narrative.py
-from fastapi import APIRouter, Depends, Query, HTTPException
+#routers/narrative.py
+from fastapi import APIRouter, Depends, Query, HTTPException, Request, Header, Response
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -754,19 +754,45 @@ def get_stored_articles(db: Session, date: datetime, organization_id: int) -> Li
     
     return articles
 
+async def verify_headers(
+    x_user_id: str = Header(...),
+    x_organization_id: str = Header(...),
+    x_user_role: str = Header(...),
+    authorization: str = Header(...)
+):
+    """Dependency to verify required headers"""
+    if not all([x_user_id, x_organization_id, x_user_role, authorization]):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing required headers"
+        )
+    return {
+        "user_id": x_user_id,
+        "org_id": x_organization_id,
+        "role": x_user_role,
+        "token": authorization
+    }
+
 @router.get("/feed", response_model=NewsFeed)
 async def get_news_feed(
+    request: Request,
     date: str = Query(default=datetime.now().strftime('%Y-%m-%d')),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    db: Session = Depends(get_db)
+
 ):
     try:
+        # Get user context from headers passed by gateway
+        user_id = request.headers.get('X-User-ID')
+        current_org_id = request.headers.get('X-Organization-ID')
+        role = request.headers.get('X-User-Role')
+        
+        if not user_id or not current_org_id:
+            raise HTTPException(status_code=401, detail="Missing user context")
+            
         end_date = datetime.strptime(date, '%Y-%m-%d')
-        user = current_user["user"]
-        current_org_id = current_user["current_org_id"]
         
         # Get organization name from database
-        org = db.query(Organization).filter(Organization.id == current_org_id).first()
+        org = db.query(Organization).filter(Organization.id == int(current_org_id)).first()
         if not org:
             raise HTTPException(status_code=404, detail="Organization not found")
             
@@ -1385,13 +1411,18 @@ def generate_pdf_fallback_single_article(article, chart_image):
 @router.post("/export-pdf-single")
 async def export_pdf_single(
     request: PDFRequest = Body(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
     try:
         article = db.query(Article).filter(Article.id == request.article_id).first()
         
         if not article:
             raise HTTPException(status_code=404, detail="Article not found")
+            
+        # Verify user has access to this article's organization
+        if article.organization_id != current_user["current_org_id"]:
+            raise HTTPException(status_code=403, detail="You don't have access to this article")
         
         news_article = NewsArticle(
             id=str(article.id),
@@ -1402,23 +1433,46 @@ async def export_pdf_single(
             graph_data={k: GraphData(**v) if isinstance(v, dict) else v for k, v in article.graph_data.items()}
         )
         
+        # Create safe filename first
+        safe_filename = "".join(c for c in article.title if c.isalnum() or c in (' ', '-', '_'))
+        filename = f"{safe_filename[:50]}.pdf"
+        
         html_content = generate_pdf_content_single_article(news_article, request.chart_image)
         
         try:
-            pdf = pdfkit.from_string(html_content, False)
+            # Generate PDF with pdfkit
+            pdf_content = pdfkit.from_string(html_content, False)
+            
+            # Return PDF as binary response
+            return Response(
+                content=pdf_content,
+                media_type='application/pdf',
+                headers={
+                    'Content-Disposition': f'attachment; filename="{filename}"',
+                    'Content-Type': 'application/pdf'
+                }
+            )
+            
         except Exception as pdfkit_error:
             logger.warning(f"pdfkit failed, using fallback method. Error: {str(pdfkit_error)}")
-            pdf = generate_pdf_fallback_single_article(news_article, request.chart_image)
-        
-        return StreamingResponse(
-            BytesIO(pdf) if isinstance(pdf, bytes) else pdf,
-            media_type='application/pdf',
-            headers={'Content-Disposition': f'attachment; filename={article.title.replace(" ", "_")}.pdf'}
-        )
+            
+            # Try fallback method
+            fallback_buffer = generate_pdf_fallback_single_article(news_article, request.chart_image)
+            pdf_content = fallback_buffer.getvalue()
+            fallback_buffer.close()
+            
+            return Response(
+                content=pdf_content,
+                media_type='application/pdf',
+                headers={
+                    'Content-Disposition': f'attachment; filename="{filename}"',
+                    'Content-Type': 'application/pdf'
+                }
+            )
+            
     except Exception as e:
-        logger.error(f"Error generating PDF: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An error occurred while generating the PDF: {str(e)}")
-
+        logger.error(f"Error generating PDF: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error generating PDF: {str(e)}")
     
 def generate_chart(chart_info):
     if not chart_info:
