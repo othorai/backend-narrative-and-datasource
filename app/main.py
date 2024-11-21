@@ -64,7 +64,6 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-app.include_router(users.router, prefix="/authorization", tags=["Login & Signup"])
 app.include_router(narrative.router, prefix="", tags=["narrative"])
 app.include_router(data_source.router, prefix="", tags=["data source"])
 
