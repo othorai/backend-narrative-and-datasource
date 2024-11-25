@@ -1,11 +1,11 @@
 # narrative service main.py
-from fastapi import FastAPI, Request, Depends, HTTPException
-import logging
-from datetime import datetime
 from fastapi.responses import JSONResponse
 from app.utils.auth import get_current_user
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import narrative, data_source, users
+from fastapi import FastAPI, Request, Depends, HTTPException
+import logging
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
