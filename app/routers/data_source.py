@@ -122,10 +122,27 @@ def discover_table_metrics(connector: Any, table_name: str) -> Dict[str, str]:
         logger.error(f"Error discovering metrics: {str(e)}")
         return {}
 
-async def fetch_data_from_all_sources(connections_info: List[Dict], end_date: datetime, db: Session) -> Dict:
-    """Fetch and aggregate data from all connected data sources."""
-    logger.info(f"Fetching data from multiple sources for end_date: {end_date}")
+async def fetch_data_from_all_sources(
+    connections_info: List[Dict], 
+    end_date: datetime, 
+    db: Session,
+    start_date: Optional[datetime] = None
+) -> Dict:
+    """
+    Fetch and aggregate data from all connected data sources.
     
+    Args:
+        connections_info: List of connection information dictionaries
+        end_date: End date for data fetching
+        db: Database session
+        start_date: Optional start date for data fetching (defaults to end_date - 1 day)
+    """
+    logger.info(f"Fetching data from multiple sources for period: {start_date} to {end_date}")
+    
+    # If no start_date provided, default to previous day for daily comparison
+    if start_date is None:
+        start_date = end_date - timedelta(days=1)
+        
     aggregated_result = {
         'metrics': {},
         'graph_data': {},
@@ -135,7 +152,14 @@ async def fetch_data_from_all_sources(connections_info: List[Dict], end_date: da
     
     for connection_info in connections_info:
         try:
-            source_data = await fetch_data_from_source(connection_info, end_date, db)
+            # Pass both start and end dates to fetch_data_from_source
+            source_data = await fetch_data_from_source(
+                connection_info=connection_info,
+                end_date=end_date,
+                db=db,
+                start_date=start_date
+            )
+            
             if not source_data or not source_data.get('graph_data'):
                 continue
 
@@ -145,7 +169,17 @@ async def fetch_data_from_all_sources(connections_info: List[Dict], end_date: da
             # Store source-specific data
             aggregated_result['sources_data'].append({
                 'source_name': source_name,
-                'metrics': source_data.get('graph_data', {})
+                'periods': {
+                    'current': {
+                        'start': start_date.strftime('%Y-%m-%d'),
+                        'end': end_date.strftime('%Y-%m-%d')
+                    },
+                    'previous': {
+                        'start': (start_date - timedelta(days=(end_date - start_date).days)).strftime('%Y-%m-%d'),
+                        'end': start_date.strftime('%Y-%m-%d')
+                    },
+                    'metrics': source_data.get('graph_data', {})
+                }
             })
             
             # Aggregate metrics across sources
@@ -181,9 +215,11 @@ async def fetch_data_from_all_sources(connections_info: List[Dict], end_date: da
         try:
             source_count = metric_data['source_count']
             if source_count > 0:
-                # Handle averaging if needed
-                if any(term in metric_name.lower() for term in 
-                    ['average', 'avg', 'rate', 'ratio', 'satisfaction', 'score']):
+                # Handle averaging for specific metric types
+                should_average = any(term in metric_name.lower() for term in 
+                    ['average', 'avg', 'rate', 'ratio', 'satisfaction', 'score'])
+                
+                if should_average:
                     metric_data['current'] /= source_count
                     metric_data['previous'] /= source_count
                 
@@ -229,13 +265,35 @@ def verify_data_exists(connector: Any, table_name: str, start_date: str, end_dat
         logger.error(f"Error verifying data existence: {str(e)}")
         return False
 
-async def fetch_data_from_source(connection_info: Dict, end_date: datetime, db: Session) -> Dict:
-    """Fetch data from a single source."""
-    logger.info(f"Fetching data for end_date: {end_date}")
+async def fetch_data_from_source(
+    connection_info: Dict, 
+    end_date: datetime, 
+    db: Session,
+    start_date: Optional[datetime] = None
+) -> Dict:
+    """
+    Fetch data from a single source for a specific time period.
+    
+    Args:
+        connection_info: Connection information dictionary
+        end_date: End date for data fetching
+        db: Database session
+        start_date: Start date for data fetching (defaults to end_date - 1 day)
+    """
+    logger.info(f"Fetching data for period: {start_date} to {end_date}")
     logger.info(f"Connection info: {json.dumps({k: v for k, v in connection_info.items() if k not in ['connection_params', 'params', 'password']})}")
     
     if not connection_info:
         raise ValueError("No connection information available")
+    
+    # If no start_date provided, default to previous day
+    if start_date is None:
+        start_date = end_date - timedelta(days=1)
+        
+    # Calculate previous period dates
+    period_length = (end_date - start_date).days
+    previous_end = start_date
+    previous_start = previous_end - timedelta(days=period_length)
     
     try:
         # Get date column and validate

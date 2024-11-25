@@ -165,6 +165,7 @@ class Article(Base):
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
     category = Column(String, nullable=False)
+    context = Column(String, nullable=False)
     time_period = Column(String, nullable=False)
     graph_data = Column(JSON, nullable=False)
     organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False)

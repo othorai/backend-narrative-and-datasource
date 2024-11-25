@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # Other settings
     DEBUG: bool = True 
     ALLOWED_HOSTS: str = "*"
+    STAGE: str = ""  
+    DEFAULT_USER_ID: str = "dev_user"
+    DEFAULT_ORG_ID: str = "1"
+    DEFAULT_USER_ROLE: str = "admin"
 
     # OpenAI settings
     OPENAI_API_KEY: str

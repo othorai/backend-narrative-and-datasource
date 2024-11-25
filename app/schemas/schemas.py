@@ -234,8 +234,9 @@ class NewsArticle(BaseModel):
     content: str
     category: str
     time_period: str
+    context: str  # New field for cleaned time period
     graph_data: Dict[str, GraphData]
-    source_info: Optional[ArticleSourceInfo] = None  
+    source_info: Optional[ArticleSourceInfo] = None
 
     class Config:
         from_attributes = True

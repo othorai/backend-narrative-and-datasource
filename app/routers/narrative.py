@@ -2,8 +2,10 @@
 from fastapi import APIRouter, Depends, Query, HTTPException, Request, Header, Response
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+import calendar
+from app.services.DynamicDataAnalysisService import DynamicAnalysisService
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from app.utils.database import get_db
 from app.models.models import WayneEnterprise, Article, Organization, MetricDefinition
 import app.models.models as models
@@ -57,7 +59,7 @@ from app.schemas.schemas import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+# Load environment variablesx
 load_dotenv()
 
 router = APIRouter()
@@ -499,7 +501,7 @@ def calculate_article_specific_graph_data(article_category: str, aggregated_data
 
     return graph_data
 
-def store_articles(db: Session, articles: List[NewsArticle], date: datetime, organization_id: int):
+def store_articles(db: Session, articles: List[NewsArticle], date: datetime, org_id: int):
     """Store articles with visualization metadata."""
     for article in articles:
         # Convert graph data to dictionary format including visualization info
@@ -520,15 +522,19 @@ def store_articles(db: Session, articles: List[NewsArticle], date: datetime, org
                 } if data.visualization else {}
             }
 
+        # Convert context and time_period
+        period = article.time_period.split()[0]  # Extract period type (daily/weekly/monthly)
+        
         db_article = Article(
             id=article.id,
             date=date,
             title=article.title,
             content=article.content,
             category=article.category,
-            time_period=article.time_period,
-            graph_data=graph_data_dict,  # Now contains serializable dictionary
-            organization_id=organization_id
+            time_period=period,  # Store just the period type
+            graph_data=article.graph_data,
+            organization_id=org_id,
+            context=article.context  # Store the context
         )
         db.add(db_article)
     
@@ -669,8 +675,6 @@ def generate_diverse_articles(current_data: Dict[str, Any], previous_data: Dict[
             graph_data={}
         )]
 
-
-
 def get_data_for_period(db: Session, start_date: datetime, end_date: datetime, org_id: int):
     # Get the organization
     org = db.query(Organization).filter(Organization.id == org_id).first()
@@ -773,163 +777,471 @@ async def verify_headers(
         "token": authorization
     }
 
-@router.get("/feed", response_model=NewsFeed)
-async def get_news_feed(
-    request: Request,
-    date: str = Query(default=datetime.now().strftime('%Y-%m-%d')),
-    db: Session = Depends(get_db)
+def get_week_of_month(date: datetime) -> int:
+    """Get week number within the month (1-5)."""
+    first_day = date.replace(day=1)
+    dom = date.day
+    adjusted_dom = dom + first_day.weekday()
+    week_of_month = (adjusted_dom - 1) // 7 + 1
+    return week_of_month
 
-):
-    try:
-        # Get user context from headers passed by gateway
-        user_id = request.headers.get('X-User-ID')
-        current_org_id = request.headers.get('X-Organization-ID')
-        role = request.headers.get('X-User-Role')
+def should_generate_feed(period: str, target_date: datetime) -> Tuple[bool, Tuple[datetime, datetime]]:
+    """
+    Determine if feed should be generated and return the appropriate date range.
+    Returns tuple of (should_generate, (start_date, end_date))
+    """
+    today = datetime.now()
+    
+    if period == "daily":
+        return True, (target_date, target_date)
         
-        if not user_id or not current_org_id:
-            raise HTTPException(status_code=401, detail="Missing user context")
+    elif period == "weekly":
+        # Get the week of month for current date
+        current_week = get_week_of_month(today)
+        target_week = get_week_of_month(target_date)
+        
+        # Calculate start and end dates for the week
+        week_start = target_date - timedelta(days=target_date.weekday())
+        week_end = week_start + timedelta(days=6)
+        
+        # Generate if it's the current week or previous week
+        if target_week == current_week or target_week == current_week - 1:
+            return True, (week_start, week_end)
             
-        end_date = datetime.strptime(date, '%Y-%m-%d')
+        return False, (None, None)
         
-        # Get organization name from database
-        org = db.query(Organization).filter(Organization.id == int(current_org_id)).first()
-        if not org:
-            raise HTTPException(status_code=404, detail="Organization not found")
-            
-        org_name = org.name
-        logger.info(f"Getting news feed for org {current_org_id} ({org_name}) on {date}")
+    elif period == "monthly":
+        today_day = today.day
+        target_month = target_date.replace(day=1)
         
-        # Get all connections for the organization
-        connections_info = get_all_connections_info(current_org_id, db)
-        logger.info(f"Found {len(connections_info)} connections for org {current_org_id}")
-        
-        if not connections_info:
-            logger.warning(f"No data sources connected for organization {org_name}")
-            return NewsFeed(articles=[
-                NewsArticle(
-                    id=str(uuid4()),
-                    title="Connect Your Data Sources",
-                    content=f"Please connect at least one data source for {org_name} to generate insights. Go to Settings > Data Sources to connect your databases.",
-                    category="System",
-                    time_period="N/A",
-                    graph_data={}
-                )
-            ])
+        if today_day <= 15:
+            # First half of month - report on previous month's second half
+            prev_month_mid = (target_month - timedelta(days=1)).replace(day=16)
+            prev_month_end = target_month - timedelta(days=1)
+            return True, (prev_month_mid, prev_month_end)
+        else:
+            # Second half of month - report on current month's first half
+            month_start = target_month
+            month_mid = target_month.replace(day=15)
+            return True, (month_start, month_mid)
+    
+    return False, (None, None)
 
-        # Check for data in any source
-        has_data = False
-        for connection in connections_info:
-            connector = None
-            try:
-                connector = ConnectorFactory.get_connector(
-                    connection['source_type'],
-                    **connection['params']
-                )
-                connector.connect()
-                
-                # Get date column
-                if not connection.get('date_column'):
-                    db_connection = db.query(models.DataSourceConnection).filter_by(id=connection['connection_id']).first()
-                    if db_connection:
-                        connection['date_column'] = db_connection.date_column
-                
-                date_column = connection.get('date_column', 'DATE')
-                table_name = connection['table_name']
-                
-                # Build and log the query before execution
-                if connection['source_type'] == 'snowflake':
-                    database = connection['params'].get('database')
-                    schema = connection['params'].get('schema')
-                    
-                    # First verify table exists
-                    verify_query = f"""
-                        SELECT COUNT(*) as EXISTS_FLAG
-                        FROM {database}.INFORMATION_SCHEMA.TABLES 
-                        WHERE TABLE_SCHEMA = '{schema}'
-                        AND TABLE_NAME = '{table_name.upper()}'
-                    """
-                    verify_result = connector.query(verify_query)
-                    if not verify_result or not verify_result[0].get('EXISTS_FLAG', 0):
-                        logger.warning(f"Table {table_name} not found in {database}.{schema}")
-                        continue
-                        
-                    # Then check for data
-                    data_query = f"""
-                        SELECT COUNT(*) as ROW_COUNT 
-                        FROM {database}.{schema}."{table_name}"
-                        WHERE "{date_column}" <= CURRENT_TIMESTAMP()
-                    """
-                    logger.info(f"Executing Snowflake query: {data_query}")
-                else:
-                    data_query = f"""
-                        SELECT COUNT(*) as row_count 
-                        FROM {table_name}
-                        WHERE {date_column} <= CURRENT_DATE
-                    """
-                    logger.info(f"Executing query: {data_query}")
-                
-                result = connector.query(data_query)
-                row_count = result[0].get('ROW_COUNT' if connection['source_type'] == 'snowflake' else 'row_count', 0)
-                
-                logger.info(f"Found {row_count} rows in {connection['name']}")
-                
-                if row_count > 0:
-                    has_data = True
-                    break
-                    
-            except Exception as e:
-                logger.error(f"Error checking data for source {connection.get('name', '')}: {str(e)}")
-                continue
-            finally:
-                if connector:
-                    try:
-                        connector.disconnect()
-                    except Exception as disconnect_error:
-                        logger.error(f"Error disconnecting: {str(disconnect_error)}")
+def format_period_data(
+    period: str,
+    target_date: datetime,
+    start_date: datetime,
+    end_date: datetime
+) -> Tuple[str, str]:
+    """
+    Format period display text and context.
+    Returns tuple of (display_text, context)
+    """
+    if period == "daily":
+        display = target_date.strftime("%d-%m-%Y")
+        context = display
         
-        if not has_data:
-            logger.warning(f"No data available in any data source for {org_name}")
-            return NewsFeed(articles=[
-                NewsArticle(
-                    id=str(uuid4()),
-                    title="No Data Available",
-                    content=f"Your data sources for {org_name} are connected but contain no data. Please ensure your data has been uploaded to the connected databases.",
-                    category="System",
-                    time_period="N/A",
-                    graph_data={}
-                )
-            ])
-            
-        # Generate articles
-        logger.info(f"Generating articles for {org_name}")
-        articles = await generate_articles_for_organization(
-            db, end_date, current_org_id, org_name
+    elif period == "weekly":
+        week_num = get_week_of_month(target_date)
+        display = f"Week {week_num}"
+        context = display
+        
+    else:  # monthly
+        if target_date.day <= 15:
+            # First half reporting on previous month's second half
+            prev_month = (target_date.replace(day=1) - timedelta(days=1))
+            display = f"{prev_month.strftime('%B %Y')} (16th-{prev_month.day})"
+            context = prev_month.strftime('%B')
+        else:
+            # Second half reporting on current month's first half
+            display = f"{target_date.strftime('%B %Y')} (1st-15th)"
+            context = target_date.strftime('%B')
+    
+    return display, context
+
+def get_period_date_range(date: datetime, period: str) -> tuple[datetime, datetime]:
+    """Get start and end dates for the specified period."""
+    if period == "daily":
+        return date, date
+    elif period == "weekly":
+        # Get Monday and Sunday of the week
+        start = date - timedelta(days=date.weekday())
+        end = start + timedelta(days=6)
+        return start, end
+    else:  # monthly
+        # First and last day of the month
+        start = date.replace(day=1)
+        end = date.replace(
+            day=calendar.monthrange(date.year, date.month)[1]
         )
+        return start, end
+
+async def check_existing_feed(db: Session, org_id: int, date: datetime, period: str) -> Optional[List[NewsArticle]]:
+    """Check if feed already exists in database."""
+    try:
+        start_date, end_date = get_period_date_range(date, period)
         
-        if not articles:
-            logger.warning(f"No articles generated for {org_name}")
-            return NewsFeed(articles=[
+        # Query existing articles
+        articles = db.query(Article).filter(
+            Article.organization_id == org_id,
+            Article.date >= start_date,
+            Article.date <= end_date,
+            Article.time_period == period
+        ).all()
+        
+        if articles:
+            return [
                 NewsArticle(
-                    id=str(uuid4()),
-                    title="Unable to Generate Narratives",
-                    content=f"We were unable to generate insights from your data. Please ensure your data sources contain the required columns and data format is correct.",
-                    category="System",
-                    time_period="N/A",
-                    graph_data={}
+                    id=str(article.id),
+                    title=article.title,
+                    content=article.content,
+                    category=article.category,
+                    time_period=f"{article.time_period} ({format_period_date(article.date, article.time_period)})",
+                    graph_data=article.graph_data,
+                    context=get_period_context(article.date, article.time_period),
                 )
-            ])
+                for article in articles
+            ]
         
-        logger.info(f"Successfully generated {len(articles)} articles for {org_name}")
-        store_articles(db, articles, end_date, current_org_id)
-        
-        return NewsFeed(articles=articles)
+        return None
         
     except Exception as e:
-        logger.error(f"Error in get_news_feed: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500, 
-            detail=f"An error occurred while generating narratives: {str(e)}"
+        logger.error(f"Error checking existing feed: {str(e)}")
+        return None
+
+def format_period_date(date: datetime, period: str) -> str:
+    """Format date based on time period."""
+    if period == "daily":
+        return date.strftime("%d-%m-%Y")
+    elif period == "weekly":
+        return f"Week {get_week_of_month(date)}"
+    else:  # monthly
+        if date.day <= 15:
+            prev_month = (date.replace(day=1) - timedelta(days=1))
+            return f"{prev_month.strftime('%B %Y')} (16th-{prev_month.day})"
+        else:
+            return f"{date.strftime('%B %Y')} (1st-15th)"
+
+def get_period_context(date: datetime, period: str) -> str:
+    """Get context for given period and date."""
+    if period == "daily":
+        return date.strftime("%d-%m-%Y")
+    elif period == "weekly":
+        return f"Week {get_week_of_month(date)}"
+    else:  # monthly
+        if date.day <= 15:
+            prev_month = (date.replace(day=1) - timedelta(days=1))
+            return prev_month.strftime('%B')
+        else:
+            return date.strftime('%B')
+                
+async def get_user_context(
+    x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
+    x_organization_id: Optional[str] = Header(None, alias="X-Organization-ID"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role")
+) -> Dict[str, Any]:
+    """Get user context with DEV mode support."""
+    logger.info(f"STAGE: {settings.STAGE}")
+    
+    if settings.STAGE == "DEV":
+        # Use default values in DEV mode
+        context = {
+            "user_id": settings.DEFAULT_USER_ID,
+            "org_id": int(settings.DEFAULT_ORG_ID),
+            "role": settings.DEFAULT_USER_ROLE
+        }
+        logger.info(f"Using DEV mode defaults: {context}")
+        return context
+    
+    # Production mode - require headers
+    if not all([x_user_id, x_organization_id, x_user_role]):
+        logger.error(f"Missing headers. Received: User ID: {x_user_id}, Org ID: {x_organization_id}, Role: {x_user_role}")
+        raise HTTPException(status_code=401, detail="Missing required headers")
+    
+    try:
+        return {
+            "user_id": x_user_id,
+            "org_id": int(x_organization_id),
+            "role": x_user_role
+        }
+    except ValueError as e:
+        logger.error(f"Error parsing organization ID: {e}")
+        raise HTTPException(status_code=400, detail="Invalid organization ID format")
+
+def get_dynamic_scope(period: str, target_date: datetime) -> Tuple[str, str]:
+    """
+    Convert period and target date into appropriate scope for DynamicAnalysisService.
+    Returns tuple of (scope, resolution).
+    """
+    today = datetime.now()
+    
+    if period == "daily":
+        days_diff = (today - target_date).days
+        if days_diff == 0:
+            return "today", "daily"
+        elif days_diff == 1:
+            return "yesterday", "daily"
+        else:
+            return f"last_{days_diff}_days", "daily"
+            
+    elif period == "weekly":
+        # Get the start of current week (Monday)
+        current_week_start = today - timedelta(days=today.weekday())
+        
+        # Calculate week number of target date
+        target_week_num = int(target_date.strftime('%U'))
+        current_week_num = int(today.strftime('%U'))
+        
+        if target_week_num == current_week_num:
+            return "this_week", "weekly"
+        elif target_week_num == current_week_num - 1:
+            return "last_week", "weekly"
+        else:
+            return "prior_week", "weekly"
+            
+    elif period == "monthly":
+        # Get first day of current month
+        current_month_start = today.replace(day=1)
+        
+        if today.day <= 15:
+            # First half of month, look at previous month
+            return "last_month", "monthly"
+        else:
+            # Second half of month, look at current month to date
+            return "month_to_date", "monthly"
+    
+    return "this_year", "monthly"  # default fallback
+
+@router.get("/feed", response_model=NewsFeed)
+async def get_news_feed(
+    date: str = Query(default=datetime.now().strftime('%Y-%m-%d')),
+    db: Session = Depends(get_db),
+    user_context: Dict[str, Any] = Depends(get_user_context)
+):
+    """Get news feed for all applicable periods."""
+    try:
+        logger.info(f"Processing feed request - User Context: {user_context}")
+        
+        org_id = user_context['org_id']
+        
+        # Validate organization exists
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if not org:
+            error_msg = f"Organization not found: {org_id}"
+            logger.error(error_msg)
+            raise HTTPException(status_code=404, detail=error_msg)
+            
+        target_date = datetime.strptime(date, '%Y-%m-%d')
+        all_articles = []
+        
+        # Initialize dynamic analysis service
+        analysis_service = DynamicAnalysisService()
+        
+        # Process each period in priority order
+        periods = ["daily", "weekly", "monthly"]
+        
+        for period in periods:
+            try:
+                should_generate, (start_date, end_date) = should_generate_feed(period, target_date)
+                
+                if not should_generate:
+                    logger.info(f"Skipping {period} feed generation for {date}")
+                    continue
+                
+                logger.info(f"Generating {period} feed for period {start_date} to {end_date}")
+                
+                # Get appropriate scope for DynamicAnalysisService
+                if period == "daily":
+                    scope = "today"
+                elif period == "weekly":
+                    scope = "this_week" if get_week_of_month(target_date) == get_week_of_month(datetime.now()) else "last_week"
+                else:  # monthly
+                    scope = "last_month" if target_date.day <= 15 else "month_to_date"
+                
+                # Check existing articles if not in DEV mode
+                existing_articles = None
+                if settings.STAGE != "DEV":
+                    existing_articles = await check_existing_feed(db, org_id, target_date, period)
+                
+                if existing_articles:
+                    logger.info(f"Found existing {period} feed")
+                    all_articles.extend(existing_articles)
+                    continue
+                
+                # Get period-specific data using dynamic analysis
+                period_data = await analysis_service.analyze_metrics(
+                    db=db,
+                    org_id=org_id,
+                    scope=scope,
+                    resolution=period,
+                    forecast=False
+                )
+                
+                if period_data and period_data.get('metrics'):
+                    # Create prompts based on analyzed data
+                    prompt = await create_dynamic_prompt(
+                        org_name=org.name,
+                        period_data=period_data,
+                        period=period,
+                        target_date=target_date
+                    )
+                    
+                    # Generate articles using analyzed data
+                    new_articles = await process_gpt_response(
+                        prompt=prompt,
+                        aggregated_data=period_data,
+                        period=period,
+                        connections_info=get_all_connections_info(org_id, db)
+                    )
+                    
+                    if new_articles:
+                        # Format period display and context
+                        display_text, context = format_period_data(
+                            period=period,
+                            target_date=target_date,
+                            start_date=start_date,
+                            end_date=end_date
+                        )
+
+                        for article in new_articles:
+                            article.time_period = f"{period} ({display_text})"
+                            article.context = context  # Add new context field
+                        
+                        # Store in database if not in DEV
+                        if settings.STAGE != "DEV":
+                            store_articles(db, new_articles, target_date, org_id)
+                        
+                        all_articles.extend(new_articles)
+                        logger.info(f"Generated {len(new_articles)} articles for {period} period")
+                
+            except Exception as e:
+                logger.error(f"Error processing {period} feed: {str(e)}")
+                continue
+        
+        if not all_articles:
+            return NewsFeed(articles=[
+                NewsArticle(
+                    id=str(uuid4()),
+                    title="No Articles Available",
+                    content="No articles could be generated for the specified date.",
+                    category="System",
+                    context="N/A",
+                    time_period="N/A",
+                    graph_data={}
+                )
+            ])
+        
+        # Sort articles by priority (daily first, then weekly, then monthly)
+        all_articles.sort(
+            key=lambda x: periods.index(x.time_period.split()[0])
         )
+        
+        logger.info(f"Successfully generated feed with {len(all_articles)} articles")
+        return NewsFeed(articles=all_articles)
+        
+    except Exception as e:
+        error_msg = f"Error in get_news_feed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+async def create_dynamic_prompt(
+    org_name: str,
+    period_data: Dict[str, Any],
+    period: str,
+    target_date: datetime
+) -> str:
+    """Create dynamic prompt based on analyzed data."""
+    try:
+        # Get appropriate date labels based on period
+        if period == "daily":
+            date_label = target_date.strftime("%d-%m-%Y")
+            comparison = "previous day"
+        elif period == "weekly":
+            week_num = int(target_date.strftime('%U'))
+            date_label = f"Week {week_num} ({target_date.strftime('%B %Y')})"
+            comparison = "previous week"
+        else:  # monthly
+            if target_date.day <= 15:
+                date_label = f"{target_date.strftime('%B %Y')} (1st-15th)"
+            else:
+                last_day = calendar.monthrange(target_date.year, target_date.month)[1]
+                date_label = f"{target_date.strftime('%B %Y')} (16th-{last_day})"
+            comparison = "previous period"
+
+        # Organize metrics by category
+        metrics_by_category = {}
+        for metric_name, metric_data in period_data.get('metrics', {}).items():
+            category = metric_data.get('category', 'Other')
+            if category not in metrics_by_category:
+                metrics_by_category[category] = []
+            metrics_by_category[category].append({
+                'name': metric_name,
+                'data': metric_data
+            })
+
+        # Build category-specific insights
+        category_insights = []
+        for category, metrics in metrics_by_category.items():
+            metric_summaries = []
+            for metric in metrics:
+                current_val = metric['data'].get('current_value', 0)
+                change_pct = metric['data'].get('change', {}).get('percentage', 0)
+                trend = "increased" if change_pct > 0 else "decreased" if change_pct < 0 else "remained stable"
+                
+                metric_summaries.append(
+                    f"{metric['name']}: {current_val:,.2f} ({trend} by {abs(change_pct):.1f}% from {comparison})"
+                )
+            
+            if metric_summaries:
+                category_insights.append(f"{category}:\n" + "\n".join(metric_summaries))
+
+        # Create comprehensive prompt
+        prompt = f"""
+        As a business analyst, generate comprehensive insights for {org_name} based on the following {period} data:
+
+        Period: {period.capitalize()} ({date_label})
+        
+        Metrics Analysis by Category:
+        {chr(10).join(category_insights)}
+
+        Key Analysis Requirements:
+        1. Focus on significant changes and their implications
+        2. Consider {period} trends and patterns
+        3. Analyze relationships between different metrics
+        4. Provide specific, actionable recommendations
+        5. Consider both positive and negative trends
+        6. Highlight opportunities for improvement
+        7. Compare performance with {comparison}
+        8. Consider the business context for each metric
+
+        Generate multiple detailed articles that:
+        1. Cover each significant metric or trend
+        2. Explain the business impact
+        3. Provide actionable insights
+        4. Reference specific numbers and changes
+        5. Suggest concrete next steps
+        6. Consider cross-category relationships
+        7. Look at both short and long-term implications
+
+        Format your response as a JSON array of objects, each with:
+        - 'title': Clear, metric-focused title
+        - 'content': 2-3 sentences of analysis and recommendations
+        - 'category': One of the available categories shown above
+
+        Generate articles for all significant metrics and trends in the data, with special attention to:
+        - Metrics with significant changes (>10% change)
+        - Interrelated metrics that tell a broader story
+        - Metrics that indicate important business trends
+        - Areas needing immediate attention or action
+
+        Do not limit the number of articles - create an article for each meaningful insight.
+        """
+
+        return prompt
+
+    except Exception as e:
+        logger.error(f"Error creating prompt: {str(e)}")
+        raise
     
 async def process_gpt_response(
     prompt: str,
@@ -937,7 +1249,10 @@ async def process_gpt_response(
     period: str,
     connections_info: List[Dict]
 ) -> List[NewsArticle]:
-    """Process GPT response and create article objects with source information."""
+    """
+    Process GPT response and create article objects with source information.
+    Integrates with DynamicAnalysisService for better metric handling.
+    """
     try:
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -958,83 +1273,126 @@ async def process_gpt_response(
         )
 
         articles = []
+        target_date = datetime.now()
+        seen_insights = set()  # Track unique insights
+
         for article_data in articles_data:
+            # Generate unique key for this insight
+            insight_key = f"{article_data['title']}_{article_data['category']}"
+            if insight_key in seen_insights:
+                continue
+            
+            seen_insights.add(insight_key)
+            
             article_text = f"{article_data['title']} {article_data['content']}".lower()
             article_metrics = {}
             used_sources = set()
             metrics_by_source = {}
 
-            # Extract numbers from the article text to help match metrics
-            numbers_in_text = set()
-            for match in re.finditer(r"[-+]?\d*\.\d+|\d+", article_text):
-                numbers_in_text.add(float(match.group()))
+            # Match metrics based on analyzed data
+            for metric_name, metric_data in aggregated_data.get('metrics', {}).items():
+                try:
+                    # Get current and previous values from the analyzed data
+                    current_val = float(metric_data.get('current_value', 0))
+                    previous_val = float(metric_data.get('previous_value', 0))
+                    change_pct = float(metric_data.get('change', {}).get('percentage', 0))
+                    
+                    # Extract numbers from the article text
+                    numbers_in_text = set()
+                    for match in re.finditer(r"[-+]?\d*\.?\d+%?", article_text):
+                        try:
+                            # Handle percentage values
+                            num_str = match.group().rstrip('%')
+                            numbers_in_text.add(float(num_str))
+                        except ValueError:
+                            continue
 
-            # Find metrics mentioned in the article based on their values
-            for metric_name, metric_data in aggregated_data['metrics'].items():
-                current_val = float(metric_data['current'])
-                previous_val = float(metric_data['previous'])
-                change_pct = float(metric_data['change_percentage'])
-                
-                # Check if metric values are mentioned in the text
-                if (round(current_val, 2) in numbers_in_text or 
-                    round(previous_val, 2) in numbers_in_text or 
-                    round(change_pct, 1) in numbers_in_text or
-                    metric_name.lower().replace('_', ' ') in article_text):
-                    
-                    # Create visualization for the metric
-                    visualization = determine_visualization(metric_name, metric_data)
-                    
-                    # Add to article metrics
-                    article_metrics[metric_name] = GraphData(
-                        current=metric_data['current'],
-                        previous=metric_data['previous'],
-                        change=metric_data['change'],
-                        change_percentage=metric_data['change_percentage'],
-                        visualization=visualization
+                    # Check if metric is mentioned or values are referenced
+                    metric_mentioned = (
+                        metric_name.lower().replace('_', ' ') in article_text or
+                        any(term in article_text for term in metric_name.lower().split('_')) or
+                        round(current_val, 2) in numbers_in_text or
+                        round(previous_val, 2) in numbers_in_text or
+                        round(change_pct, 1) in numbers_in_text
                     )
 
-                    # Track source information
-                    for source_name, source_values in metric_data['source_values'].items():
-                        used_sources.add(source_name)
-                        
-                        if source_name not in metrics_by_source:
-                            metrics_by_source[source_name] = MetricSourceInfo(
-                                metrics=[],
-                                values={}
-                            )
-                        
-                        if metric_name not in metrics_by_source[source_name].metrics:
-                            metrics_by_source[source_name].metrics.append(metric_name)
-                            metrics_by_source[source_name].values[metric_name] = source_values
+                    if metric_mentioned:
+                        # Get visualization from analyzed data
+                        visualization = Visualization(
+                            type=metric_data.get('visualization_type', 'line'),
+                            axis_label=metric_data.get('axis_label', 'Value'),
+                            value_format=metric_data.get('value_format', {
+                                'type': 'number',
+                                'decimal_places': 2,
+                                'prefix': '',
+                                'suffix': '',
+                                'use_grouping': True
+                            }),
+                            show_points=metric_data.get('show_points', True),
+                            stack_type=metric_data.get('stack_type'),
+                            show_labels=metric_data.get('show_labels', True)
+                        )
 
-            # Create source info for sources that provided metrics used in this article
-            relevant_sources = [
-                SourceInfo(
-                    id=connection['id'],
-                    name=connection['name'],
-                    type=connection['source_type']
-                )
-                for connection in connections_info
-                if connection['name'] in used_sources
-            ]
+                        # Create graph data with analyzed information
+                        article_metrics[metric_name] = GraphData(
+                            current=current_val,
+                            previous=previous_val,
+                            change=float(metric_data.get('change', {}).get('absolute', 0)),
+                            change_percentage=change_pct,
+                            visualization=visualization
+                        )
 
-            # Create source info if there are relevant sources
+                        # Track source information
+                        for source_info in metric_data.get('sources', []):
+                            source_name = source_info.get('name', 'Unknown')
+                            used_sources.add(source_name)
+                            
+                            if source_name not in metrics_by_source:
+                                metrics_by_source[source_name] = MetricSourceInfo(
+                                    metrics=[],
+                                    values={}
+                                )
+                            
+                            if metric_name not in metrics_by_source[source_name].metrics:
+                                metrics_by_source[source_name].metrics.append(metric_name)
+                                metrics_by_source[source_name].values[metric_name] = {
+                                    'current': source_info.get('current', 0),
+                                    'previous': source_info.get('previous', 0),
+                                    'change': source_info.get('change', {}).get('absolute', 0),
+                                    'change_percentage': source_info.get('change', {}).get('percentage', 0)
+                                }
+
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Error processing metric {metric_name}: {str(e)}")
+                    continue
+
+            # Create source info for relevant sources
             source_info = None
-            if relevant_sources:
-                source_info = ArticleSourceInfo(
-                    sources=relevant_sources,
-                    metrics_by_source={
-                        source_name: source_data
-                        for source_name, source_data in metrics_by_source.items()
-                    }
-                )
+            if used_sources:
+                relevant_sources = [
+                    SourceInfo(
+                        id=connection['id'],
+                        name=connection['name'],
+                        type=connection['source_type']
+                    )
+                    for connection in connections_info
+                    if connection['name'] in used_sources
+                ]
+                
+                if relevant_sources:
+                    source_info = ArticleSourceInfo(
+                        sources=relevant_sources,
+                        metrics_by_source=metrics_by_source
+                    )
 
+            # Create article with enhanced information
             article = NewsArticle(
                 id=str(uuid4()),
                 title=article_data['title'],
                 content=article_data['content'],
                 category=article_data['category'],
-                time_period=period,
+                time_period=f"{period} ({format_period_date(target_date, period)})",
+                context=get_period_context(target_date, period),
                 graph_data=article_metrics,
                 source_info=source_info
             )
@@ -1044,7 +1402,7 @@ async def process_gpt_response(
         return articles
 
     except Exception as e:
-        logger.error(f"Error processing GPT response: {str(e)}")
+        logger.error(f"Error processing GPT response: {str(e)}", exc_info=True)
         raise
 
 
@@ -1158,158 +1516,224 @@ def determine_visualization(metric_name: str, metric_data: Dict[str, Any]) -> Vi
         show_labels=vis_props['show_labels']
     )
 
-def prepare_article_summary(aggregated_data: Dict[str, Any], period: str, period_end: datetime) -> str:
-    """Prepare detailed summary for article generation."""
-    if not aggregated_data or not aggregated_data.get('metrics'):
-        return ""
-        
-    summary_parts = [
-        f"Period: {period.capitalize()} ending {period_end.strftime('%Y-%m-%d')}\n"
-    ]
-    
-    # Add overall metrics summary
-    summary_parts.append("Overall Metrics:")
-    for metric_name, metric_data in aggregated_data['metrics'].items():
-        if metric_data['source_count'] > 0:  # Only include metrics with data
-            formatted_name = format_metric_name(metric_name)
-            value_str = format_metric_value(metric_name, metric_data['current'])
-            change_str = f"{metric_data['change_percentage']:.1f}%"
-            source_count = metric_data['source_count']
-            
-            summary_parts.append(
-                f"{formatted_name}: {value_str} (Change: {change_str}, Sources: {source_count})"
-            )
-            
-            # Add source breakdown
-            if source_count > 1:  # Only show breakdown for multi-source metrics
-                summary_parts.append("Source Breakdown:")
-                for source_name, source_data in metric_data['source_values'].items():
-                    source_value = format_metric_value(metric_name, source_data['current'])
-                    source_change = f"{source_data['change_percentage']:.1f}%"
-                    summary_parts.append(f"  - {source_name}: {source_value} (Change: {source_change})")
-            
-            summary_parts.append("")  # Empty line for readability
-    
-    return "\n".join(summary_parts)
-
 async def generate_articles_for_organization(
     db: Session, 
-    end_date: datetime, 
+    target_date: datetime, 
     org_id: int, 
-    org_name: str
+    period: str
 ) -> List[NewsArticle]:
+    """Generate comprehensive articles for an organization across different time periods."""
     try:
         connections_info = get_all_connections_info(org_id, db)
         if not connections_info:
             return [NewsArticle(
                 id=str(uuid4()),
                 title="No Data Sources Connected",
-                content=f"Please connect at least one data source for {org_name} to generate insights.",
+                content=f"Please connect at least one data source to generate insights.",
                 category="System",
-                time_period="N/A",
+                time_period=f"{period} ({format_period_date(target_date, period)})",
                 graph_data={},
                 source_info=None
             )]
 
-        # Get all discovered metrics for each connection
-        all_metrics = {}
-        for connection in connections_info:
-            metrics = db.query(MetricDefinition).filter(
-                MetricDefinition.connection_id == connection['connection_id']
-            ).all()
-            all_metrics[connection['id']] = metrics
+        # Calculate date range based on period
+        start_date, end_date = get_period_date_range(target_date, period)
+        logger.info(f"Generating {period} articles for period: {start_date} to {end_date}")
 
-        time_periods = ['daily', 'weekly', 'monthly']
-        all_articles = []
+        # Get period-specific data
+        current_data = await fetch_data_from_all_sources(
+            connections_info,
+            end_date,
+            db,
+            start_date=start_date
+        )
 
-        for period in time_periods:
-            try:
-                # Get aggregated data with source information
-                aggregated_data = await fetch_data_from_all_sources(
-                    connections_info,
-                    end_date,
-                    db
-                )
+        # Calculate previous period
+        previous_period = {
+            "daily": timedelta(days=1),
+            "weekly": timedelta(weeks=1),
+            "monthly": timedelta(days=30)  # Approximate month
+        }
+        period_delta = previous_period[period]
+        prev_end = start_date
+        prev_start = prev_end - period_delta
 
-                if not aggregated_data:
-                    continue
+        previous_data = await fetch_data_from_all_sources(
+            connections_info,
+            prev_end,
+            db,
+            start_date=prev_start
+        )
 
-                # Prepare detailed summary including metrics metadata
-                summary = prepare_article_summary(aggregated_data, period, end_date)
-                if not summary:
-                    continue
-
-                # Enhance the prompt with metrics metadata
-                metrics_info = []
-                for conn_id, metrics in all_metrics.items():
-                    for metric in metrics:
-                        metrics_info.append({
-                            'name': metric.name,
-                            'category': metric.category,
-                            'business_context': metric.business_context,
-                            'visualization_type': metric.visualization_type
-                        })
-
-                prompt = f"""
-                As a business analyst, generate 5 diverse news articles for {org_name} based on the following {period} data summary:
-                {summary}
-
-                Available Metrics Information:
-                {json.dumps(metrics_info, indent=2)}
-
-                Consider that the data comes from {len(connections_info)} sources. Generate insights that:
-                1. Use the provided metrics in their appropriate business context
-                2. Group related metrics by their categories
-                3. Suggest appropriate visualizations based on the metric types
-                4. Reference specific numbers and changes
-                5. Provide context based on the metric's business context
-                6. Keep content concise (2-3 sentences)
-
-                Format your response as a JSON array of objects, each with:
-                - title: Title of the article
-                - content: Article content
-                - category: One of the available metric categories
-                - metrics_used: Array of metric names used in the article
-                - suggested_visualizations: Array of visualization types for the metrics
-                """
-
-                # Generate and process articles with source information
-                articles = await process_gpt_response(
-                    prompt, 
-                    aggregated_data, 
-                    period, 
-                    connections_info
-                )
-                
-                all_articles.extend(articles)
-
-            except Exception as e:
-                logger.error(f"Error generating articles for {period} period: {str(e)}")
-
-        if not all_articles:
+        if not current_data or not previous_data:
             return [NewsArticle(
                 id=str(uuid4()),
-                title="No Insights Available",
-                content=f"We couldn't generate insights for {org_name}. Please ensure your data sources contain valid metrics data.",
+                title=f"No Data Available for {period.capitalize()} Analysis",
+                content=f"No data available for the {period} period ending {end_date.strftime('%Y-%m-%d')}.",
                 category="System",
-                time_period="N/A",
+                time_period=f"{period} ({format_period_date(target_date, period)})",
                 graph_data={},
                 source_info=None
             )]
 
-        return all_articles
+        # Get organization name
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        org_name = org.name if org else "Organization"
+
+        # Period-specific context
+        period_contexts = {
+            "daily": {
+                "timeframe": "day",
+                "comparison": "yesterday",
+                "trend_scope": "daily operations"
+            },
+            "weekly": {
+                "timeframe": "week",
+                "comparison": "last week",
+                "trend_scope": "weekly performance"
+            },
+            "monthly": {
+                "timeframe": "month",
+                "comparison": "last month",
+                "trend_scope": "monthly trends"
+            }
+        }
+        context = period_contexts[period]
+
+        # Create detailed summary
+        summary = prepare_article_summary(
+            current_data,
+            period,
+            end_date
+        )
+
+        # Create comprehensive prompt
+        prompt = f"""
+        As a business analyst, generate comprehensive insights for {org_name} based on {context['timeframe']} data:
+        
+        Period: {period.capitalize()} ({format_period_date(target_date, period)})
+        Date Range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}
+        
+        Data Summary:
+        {summary}
+        
+        Generate multiple detailed articles covering:
+        1. Key Performance Indicators:
+           - Financial metrics and their implications
+           - Operational efficiency indicators
+           - Revenue and cost analysis
+        
+        2. Human Resources & Training:
+           - Employee performance metrics
+           - Training and development indicators
+           - Workforce efficiency measures
+        
+        3. Customer Metrics:
+           - Customer satisfaction and retention
+           - Service quality indicators
+           - Customer behavior patterns
+        
+        4. Operational Excellence:
+           - Process efficiency metrics
+           - Resource utilization
+           - Productivity indicators
+        
+        5. Growth & Development:
+           - Market performance indicators
+           - Development metrics
+           - Innovation measures
+        
+        For each article:
+        1. Focus on trends specific to this {period} period
+        2. Compare with {context['comparison']}'s performance
+        3. Provide actionable insights and recommendations
+        4. Reference specific numbers and percentage changes
+        5. Consider the impact on {context['trend_scope']}
+        6. Highlight both positive and negative trends
+        7. Suggest strategic actions based on the data
+        
+        Format your response as a JSON array of objects, each with:
+        - 'title': Clear, metric-focused title
+        - 'content': 2-3 sentences of analysis and recommendations
+        - 'category': Relevant business category
+        
+        Do not limit the number of articles - generate an article for each significant metric or trend in the data.
+        """
+
+        # Generate articles with period-specific data
+        articles = await process_gpt_response(
+            prompt,
+            current_data,
+            period,
+            connections_info
+        )
+
+        # Add period-specific formatting to articles
+        formatted_articles = []
+        for article in articles:
+            formatted_article = article
+            formatted_article.time_period = f"{period} ({format_period_date(target_date, period)})"
+            formatted_articles.append(formatted_article)
+
+        logger.info(f"Generated {len(formatted_articles)} articles for {period} period")
+        return formatted_articles
 
     except Exception as e:
-        logger.error(f"Error in generate_articles: {str(e)}")
+        logger.error(f"Error generating {period} articles: {str(e)}", exc_info=True)
         return [NewsArticle(
             id=str(uuid4()),
-            title="Error Generating Articles",
+            title=f"Error Generating {period.capitalize()} Articles",
             content=f"An error occurred while generating articles: {str(e)}",
             category="Error",
-            time_period="N/A",
+            time_period=f"{period} ({format_period_date(target_date, period)})",
             graph_data={},
             source_info=None
         )]
+
+def prepare_article_summary(
+    aggregated_data: Dict[str, Any], 
+    period: str,
+    period_end: datetime
+) -> str:
+    """Prepare period-specific summary for article generation."""
+    if not aggregated_data or not aggregated_data.get('metrics'):
+        return ""
+        
+    period_names = {
+        "daily": "day",
+        "weekly": "week",
+        "monthly": "month"
+    }
+    
+    summary_parts = [
+        f"Analysis for the {period_names[period]} ending {period_end.strftime('%Y-%m-%d')}\n"
+    ]
+    
+    # Add metrics summary with period context
+    metrics_added = set()
+    for metric_name, metric_data in aggregated_data['metrics'].items():
+        if metric_data['source_count'] > 0 and metric_name not in metrics_added:
+            formatted_name = format_metric_name(metric_name)
+            value_str = format_metric_value(metric_name, metric_data['current'])
+            change_str = f"{metric_data['change_percentage']:.1f}%"
+            source_count = metric_data['source_count']
+            
+            summary_parts.append(
+                f"{formatted_name}: {value_str} (Change from previous {period_names[period]}: {change_str})"
+            )
+            
+            # Add source breakdown for multiple sources
+            if source_count > 1:
+                summary_parts.append("Source Breakdown:")
+                for source_name, source_data in metric_data['source_values'].items():
+                    source_value = format_metric_value(metric_name, source_data['current'])
+                    source_change = f"{source_data['change_percentage']:.1f}%"
+                    summary_parts.append(f"  - {source_name}: {source_value} (Change: {source_change})")
+            
+            metrics_added.add(metric_name)
+            summary_parts.append("")  # Empty line for readability
+    
+    return "\n".join(summary_parts)
     
 def generate_pdf_content_single_article(article, chart_image):
     html_content = f"""
