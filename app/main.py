@@ -10,7 +10,7 @@ from app.utils.config import settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-app = FastAPI()
+app = FastAPI(root_path="/backend-narrative-and-datasource")
 
 
 @app.middleware("http")
