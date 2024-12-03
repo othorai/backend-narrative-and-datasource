@@ -502,48 +502,70 @@ def calculate_article_specific_graph_data(article_category: str, aggregated_data
     return graph_data
 
 def store_articles(db: Session, articles: List[NewsArticle], date: datetime, org_id: int):
-    """Store articles with visualization metadata."""
+    """Store articles with visualization metadata and suggested questions."""
     for article in articles:
-        # Convert graph data to dictionary format including visualization info
-        graph_data_dict = {}
-        for metric, data in article.graph_data.items():
-            graph_data_dict[metric] = {
-                'current': data.current,
-                'previous': data.previous,
-                'change': data.change,
-                'change_percentage': data.change_percentage,
-                'visualization': {
-                    'type': data.visualization.type if data.visualization else None,
-                    'axis_label': data.visualization.axis_label if data.visualization else None,
-                    'value_format': data.visualization.value_format if data.visualization else {},
-                    'show_points': data.visualization.show_points if data.visualization else False,
-                    'stack_type': data.visualization.stack_type if data.visualization else None,
-                    'show_labels': data.visualization.show_labels if data.visualization else False
-                } if data.visualization else {}
-            }
+        try:
+            # Convert graph data to dictionary format including visualization info
+            graph_data_dict = {}
+            for metric, data in article.graph_data.items():
+                graph_data_dict[metric] = {
+                    'current': data.current,
+                    'previous': data.previous,
+                    'change': data.change,
+                    'change_percentage': data.change_percentage,
+                    'visualization': {
+                        'type': data.visualization.type if data.visualization else None,
+                        'axis_label': data.visualization.axis_label if data.visualization else None,
+                        'value_format': data.visualization.value_format if data.visualization else {},
+                        'show_points': data.visualization.show_points if data.visualization else False,
+                        'stack_type': data.visualization.stack_type if data.visualization else None,
+                        'show_labels': data.visualization.show_labels if data.visualization else False
+                    } if data.visualization else {}
+                }
 
-        # Convert context and time_period
-        period = article.time_period.split()[0]  # Extract period type (daily/weekly/monthly)
-        
-        db_article = Article(
-            id=article.id,
-            date=date,
-            title=article.title,
-            content=article.content,
-            category=article.category,
-            time_period=period,  # Store just the period type
-            graph_data=article.graph_data,
-            organization_id=org_id,
-            context=article.context  # Store the context
-        )
-        db.add(db_article)
+            # Extract period from time_period (e.g., "daily (2024-01-01)" -> "daily")
+            period = article.time_period.split()[0] if article.time_period else None
+
+            # Create the database article
+            db_article = Article(
+                id=article.id,
+                date=date,
+                title=article.title,
+                content=article.content,
+                category=article.category,
+                time_period=period,
+                context=article.context,
+                graph_data=graph_data_dict,
+                organization_id=org_id,
+                suggested_questions=None  # Initialize with no questions
+            )
+
+            # Check if article already exists
+            existing_article = db.query(Article).filter(Article.id == article.id).first()
+            if existing_article:
+                # Update existing article
+                for key, value in db_article.__dict__.items():
+                    if not key.startswith('_'):
+                        setattr(existing_article, key, value)
+            else:
+                # Add new article
+                db.add(db_article)
+
+            logger.info(f"Storing article: {article.id} for org: {org_id}")
+            
+        except Exception as e:
+            logger.error(f"Error storing article {article.id}: {str(e)}")
+            continue
     
     try:
         db.commit()
+        logger.info(f"Successfully stored {len(articles)} articles")
     except Exception as e:
-        logger.error(f"Error storing articles: {str(e)}")
+        logger.error(f"Error committing articles to database: {str(e)}")
         db.rollback()
         raise
+
+    return True
 
 def format_metric_value(metric_name: str, value: Any) -> str:
     """Format metric values based on their type and name patterns."""
@@ -1103,10 +1125,58 @@ async def get_news_feed(
                             end_date=end_date
                         )
 
+                        # Get connections info once for all articles
+                        connections_info = get_all_connections_info(org_id, db)
+
                         for article in new_articles:
                             article.time_period = f"{period} ({display_text})"
                             article.context = context  # Add new context field
-                        
+
+                            # Create source info for metrics in the article
+                            used_sources = set()
+                            metrics_by_source = {}
+
+                            # Process each metric to track source information
+                            for metric_name, metric_data in period_data.get('metrics', {}).items():
+                                if metric_name in article.graph_data:
+                                    # Track source information for this metric
+                                    for source_info in metric_data.get('sources', []):
+                                        source_name = source_info.get('name', 'Unknown')
+                                        used_sources.add(source_name)
+                                        
+                                        if source_name not in metrics_by_source:
+                                            metrics_by_source[source_name] = MetricSourceInfo(
+                                                metrics=[],
+                                                values={}
+                                            )
+                                        
+                                        if metric_name not in metrics_by_source[source_name].metrics:
+                                            metrics_by_source[source_name].metrics.append(metric_name)
+                                            metrics_by_source[source_name].values[metric_name] = {
+                                                'current': source_info.get('current', 0),
+                                                'previous': source_info.get('previous', 0),
+                                                'change': source_info.get('change', {}).get('absolute', 0),
+                                                'change_percentage': source_info.get('change', {}).get('percentage', 0)
+                                            }
+
+                            # Create source info if we found any sources
+                            if used_sources:
+                                relevant_sources = [
+                                    SourceInfo(
+                                        id=connection['id'],
+                                        name=connection['name'],
+                                        type=connection['source_type']
+                                    )
+                                    for connection in connections_info
+                                    if connection['name'] in used_sources
+                                ]
+                                
+                                if relevant_sources:
+                                    article.source_info = ArticleSourceInfo(
+                                        sources=relevant_sources,
+                                        metrics_by_source=metrics_by_source
+                                    )
+
                         # Store in database if not in DEV
                         if settings.STAGE != "DEV":
                             store_articles(db, new_articles, target_date, org_id)
@@ -1932,14 +2002,6 @@ async def get_article_suggested_questions(
 ):
     """
     Generate suggested questions using GPT based on article content and metrics.
-    
-    Args:
-        article_id (str): UUID of the article
-        db (Session): Database session
-        current_user (dict): Current user information
-        
-    Returns:
-        List[str]: List of suggested questions related to the article content
     """
     try:
         # Validate user
@@ -1950,9 +2012,18 @@ async def get_article_suggested_questions(
         # Get the article
         article = db.query(Article).filter(Article.id == article_id).first()
         if not article:
-            raise HTTPException(status_code=404, detail="Article not found")
+            logger.error(f"Article not found with ID: {article_id}")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Article not found with ID: {article_id}"
+            )
 
-        # Extract metrics data and format it for the prompt
+        # Check for cached questions first
+        if article.suggested_questions:
+            logger.info(f"Returning cached questions for article {article_id}")
+            return article.suggested_questions
+
+        # If no cached questions, generate new ones
         metrics_data = article.graph_data if article.graph_data else {}
         metrics_summary = []
         
@@ -1971,7 +2042,7 @@ async def get_article_suggested_questions(
             except (ValueError, TypeError) as e:
                 continue
 
-        # Create a detailed prompt for GPT
+        # Create prompt for GPT
         prompt = f"""As a business analyst, generate upto 8 insightful follow-up questions for this article which should be less than 7 words:
 
 Article Title: {article.title}
@@ -1992,12 +2063,9 @@ Generate questions that:
 7. Consider future implications
 8. Connect to broader business context
 
-Format your response as a JSON array of strings, each string being a question.
-Include a mix of questions about performance analysis, strategic implications, and actionable insights.
-"""
+Format your response as a JSON array of strings, each string being a question."""
 
         try:
-            # Get response from OpenAI
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
@@ -2007,30 +2075,25 @@ Include a mix of questions about performance analysis, strategic implications, a
                 temperature=0.7
             )
 
-            # Extract questions from response
             response_text = response.choices[0].message.content.strip()
             
-            # Handle different response formats
             try:
                 if response_text.startswith('```json'):
-                    # Extract JSON from code block
                     json_str = response_text.split('```json')[1].split('```')[0]
-                    gpt_questions = json.loads(json_str)
+                    questions = json.loads(json_str)
                 else:
-                    # Try direct JSON parsing
-                    gpt_questions = json.loads(response_text)
+                    questions = json.loads(response_text)
             except json.JSONDecodeError:
-                # Fallback: extract questions line by line
-                gpt_questions = [
+                questions = [
                     line.strip().strip('"-,')
                     for line in response_text.split('\n')
                     if line.strip().endswith('?')
                 ]
 
-            # Add rule-based questions as backup
+            # Add rule-based questions
             rule_based_questions = []
             
-            # Add questions for significant metric changes
+            # Add metric-based questions
             for metric_name, metric_data in metrics_data.items():
                 try:
                     change_pct = float(metric_data.get('change_percentage', 0))
@@ -2038,53 +2101,62 @@ Include a mix of questions about performance analysis, strategic implications, a
                         display_name = metric_name.replace('_', ' ').title()
                         direction = "increase" if change_pct > 0 else "decrease"
                         rule_based_questions.append(
-                            f"What factors contributed to the {abs(change_pct):.1f}% {direction} in {display_name}?"
+                            f"What factors contributed to {display_name} {direction}?"
                         )
                 except (ValueError, TypeError):
                     continue
 
-            # Add time-period specific question
+            # Add period-specific questions
             period = article.time_period.lower()
             if 'monthly' in period:
-                rule_based_questions.append("How do these monthly trends compare to our quarterly targets?")
+                rule_based_questions.append("How do monthly trends affect quarterly targets?")
             elif 'quarterly' in period:
-                rule_based_questions.append("What are the implications for our annual objectives?")
+                rule_based_questions.append("What are annual objective implications?")
             elif 'weekly' in period:
-                rule_based_questions.append("How do these weekly patterns align with monthly trends?")
+                rule_based_questions.append("How do weekly patterns affect month?")
 
-            # Add category-specific question
+            # Add category-specific questions
             category = article.category.lower()
             if 'financial' in category:
-                rule_based_questions.append("What is the projected impact on our annual financial goals?")
+                rule_based_questions.append("Impact on annual financial goals?")
             elif 'customer' in category:
-                rule_based_questions.append("How can we leverage these insights to improve customer experience?")
+                rule_based_questions.append("How to improve customer experience?")
             elif 'performance' in category:
-                rule_based_questions.append("What operational improvements could maintain this performance?")
+                rule_based_questions.append("What improvements maintain performance?")
 
             # Combine and deduplicate questions
-            all_questions = gpt_questions + rule_based_questions
-            unique_questions = list(dict.fromkeys(all_questions))  # Preserve order while deduplicating
+            all_questions = questions + rule_based_questions
+            unique_questions = list(dict.fromkeys(all_questions))
+            final_questions = unique_questions[:5]
 
-            # Return top 5 questions, prioritizing GPT-generated ones
-            return unique_questions[:5]
+            # Cache the questions
+            article.suggested_questions = final_questions
+            db.commit()
+            
+            return final_questions
 
         except Exception as e:
             logger.error(f"Error with GPT question generation: {str(e)}")
-            # Fallback to rule-based questions
-            return [
-                f"What are the key drivers behind these {article.category.lower()} results?",
-                f"How do these trends compare to our historical {article.time_period.lower()} performance?",
-                "What strategic actions should we consider based on these insights?",
-                "How do these results affect our business objectives?",
-                "What additional analysis would help us better understand these trends?"
+            fallback_questions = [
+                f"What drives changes in {article.category}?",
+                f"How does {article.time_period} compare historically?",
+                "What strategic actions are needed?",
+                "How do results affect objectives?",
+                "What further analysis is needed?"
             ]
+            
+            # Cache fallback questions
+            article.suggested_questions = fallback_questions
+            db.commit()
+            
+            return fallback_questions
 
     except Exception as e:
         logger.exception(f"Error generating article questions: {str(e)}")
         return [
-            f"What insights can we draw from this {article.category.lower()} analysis?",
-            "What actions should we take based on these findings?",
-            "How does this impact our current strategies?",
-            "What stakeholders should be informed about these results?",
-            "What additional data would help us better understand these trends?"
+            "What insights can we draw?",
+            "What actions should we take?",
+            "How does this impact strategy?",
+            "Who needs to know this?",
+            "What additional data needed?"
         ]
