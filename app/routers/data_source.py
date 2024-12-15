@@ -733,3 +733,53 @@ async def list_organization_data_sources(
     except Exception as e:
         logger.error(f"Error listing data sources: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
+    
+@router.put("/connections/{connection_id}")
+async def update_data_source(
+    connection_id: str,
+    connection: DataSourceConnection,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        org_id = current_user["current_org_id"]
+        
+        # Find existing connection
+        db_connection = db.query(models.DataSourceConnection).filter(
+            models.DataSourceConnection.id == connection_id,
+            models.DataSourceConnection.organization_id == org_id
+        ).first()
+        
+        if not db_connection:
+            raise HTTPException(status_code=404, detail="Connection not found")
+        
+        # Update the name
+        db_connection.name = connection.name
+        
+        # Update other fields if needed
+        if connection.table_name:
+            db_connection.table_name = connection.table_name
+        
+        if connection.source_type:
+            db_connection.source_type = connection.source_type
+            
+        if any(val for val in connection.dict().values()):
+            db_connection.connection_params = {
+                **db_connection.connection_params,
+                **{k: v for k, v in connection.dict().items() if v is not None}
+            }
+            
+        db.commit()
+        
+        return {
+            "message": "Data source updated successfully",
+            "connection_id": connection_id,
+            "name": db_connection.name
+        }
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error updating data source: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))

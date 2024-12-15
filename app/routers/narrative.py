@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, Query, HTTPException, Request, Header, Response
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+import uuid
 import calendar
 from app.services.DynamicDataAnalysisService import DynamicAnalysisService
 from datetime import datetime, timedelta
@@ -514,37 +515,32 @@ def store_articles(db: Session, articles: List[NewsArticle], date: datetime, org
                     'change': data.change,
                     'change_percentage': data.change_percentage,
                     'visualization': {
-                        'type': data.visualization.type if data.visualization else None,
-                        'axis_label': data.visualization.axis_label if data.visualization else None,
+                        'type': data.visualization.type if data.visualization else 'line',
+                        'axis_label': data.visualization.axis_label if data.visualization else 'Value',
                         'value_format': data.visualization.value_format if data.visualization else {},
-                        'show_points': data.visualization.show_points if data.visualization else False,
+                        'show_points': data.visualization.show_points if data.visualization else True,
                         'stack_type': data.visualization.stack_type if data.visualization else None,
-                        'show_labels': data.visualization.show_labels if data.visualization else False
+                        'show_labels': data.visualization.show_labels if data.visualization else True
                     } if data.visualization else {}
                 }
-
-            # Extract period from time_period (e.g., "daily (2024-01-01)" -> "daily")
-            period = article.time_period.split()[0] if article.time_period else None
-
-            # Create the database article
+                
             db_article = Article(
-                id=article.id,
+                id=uuid.UUID(article.id),  # Convert string ID to UUID
                 date=date,
                 title=article.title,
                 content=article.content,
                 category=article.category,
-                time_period=period,
-                context=article.context,
+                time_period=article.time_period,
+                context=getattr(article, 'context', None),  # Get context if it exists
                 graph_data=graph_data_dict,
-                organization_id=org_id,
-                suggested_questions=None  # Initialize with no questions
+                organization_id=org_id
             )
 
             # Check if article already exists
-            existing_article = db.query(Article).filter(Article.id == article.id).first()
+            existing_article = db.query(Article).filter(Article.id == db_article.id).first()
             if existing_article:
                 # Update existing article
-                for key, value in db_article.__dict__.items():
+                for key, value in vars(db_article).items():
                     if not key.startswith('_'):
                         setattr(existing_article, key, value)
             else:
@@ -962,8 +958,6 @@ async def get_user_context(
     x_organization_id: Optional[str] = Header(None, alias="X-Organization-ID"),
     x_user_role: Optional[str] = Header(None, alias="X-User-Role")
 ) -> Dict[str, Any]:
-    """Get user context with DEV mode support."""
-    logger.info(f"STAGE: {settings.STAGE}")
     
     if settings.STAGE == "DEV":
         # Use default values in DEV mode
@@ -1082,8 +1076,7 @@ async def get_news_feed(
                 
                 # Check existing articles if not in DEV mode
                 existing_articles = None
-                if settings.STAGE != "DEV":
-                    existing_articles = await check_existing_feed(db, org_id, target_date, period)
+                existing_articles = await check_existing_feed(db, org_id, target_date, period)
                 
                 if existing_articles:
                     logger.info(f"Found existing {period} feed")
@@ -1177,9 +1170,7 @@ async def get_news_feed(
                                         metrics_by_source=metrics_by_source
                                     )
 
-                        # Store in database if not in DEV
-                        if settings.STAGE != "DEV":
-                            store_articles(db, new_articles, target_date, org_id)
+                        store_articles(db, new_articles, target_date, org_id)
                         
                         all_articles.extend(new_articles)
                         logger.info(f"Generated {len(new_articles)} articles for {period} period")
