@@ -168,6 +168,7 @@ class Article(Base):
     context = Column(String, nullable=False)
     time_period = Column(String, nullable=False)
     graph_data = Column(JSON, nullable=False)
+    suggested_questions = Column(JSON, nullable=True)  # Add this column
     organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False)
     likes = relationship("LikedPost", back_populates="article")
 

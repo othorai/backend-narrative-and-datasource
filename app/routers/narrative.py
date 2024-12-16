@@ -1028,6 +1028,60 @@ def get_dynamic_scope(period: str, target_date: datetime) -> Tuple[str, str]:
     
     return "this_year", "monthly"  # default fallback
 
+async def get_existing_narratives(db: Session, date: datetime, org_id: int) -> Optional[List[NewsArticle]]:
+    """Get existing narratives for the given date and organization."""
+    try:
+        # Query existing articles for the date and organization
+        articles = db.query(Article).filter(
+            Article.date == date.date(),  # Use .date() to ignore time component
+            Article.organization_id == org_id
+        ).all()
+        
+        if not articles:
+            return None
+            
+        # Convert to NewsArticle format
+        narratives = []
+        for article in articles:
+            # Convert stored graph data to GraphData format
+            graph_data = {}
+            for metric_name, data in article.graph_data.items():
+                visualization = None
+                if 'visualization' in data:
+                    visualization = Visualization(
+                        type=data['visualization'].get('type', 'line'),
+                        axis_label=data['visualization'].get('axis_label', 'Value'),
+                        value_format=data['visualization'].get('value_format', {}),
+                        show_points=data['visualization'].get('show_points', True),
+                        stack_type=data['visualization'].get('stack_type'),
+                        show_labels=data['visualization'].get('show_labels', True)
+                    )
+
+                graph_data[metric_name] = GraphData(
+                    current=float(data.get('current', 0)),
+                    previous=float(data.get('previous', 0)),
+                    change=float(data.get('change', 0)),
+                    change_percentage=float(data.get('change_percentage', 0)),
+                    visualization=visualization
+                )
+
+            narratives.append(NewsArticle(
+                id=str(article.id),
+                title=article.title,
+                content=article.content,
+                category=article.category,
+                time_period=article.time_period,
+                context=article.context,
+                graph_data=graph_data
+            ))
+            
+        logger.info(f"Found {len(narratives)} existing narratives for date {date.date()} and org {org_id}")
+        return narratives
+        
+    except Exception as e:
+        logger.error(f"Error fetching existing narratives: {str(e)}")
+        return None
+    
 @router.get("/feed", response_model=NewsFeed)
 async def get_news_feed(
     date: str = Query(default=datetime.now().strftime('%Y-%m-%d')),
@@ -1048,6 +1102,14 @@ async def get_news_feed(
             raise HTTPException(status_code=404, detail=error_msg)
             
         target_date = datetime.strptime(date, '%Y-%m-%d')
+        
+        # Check for existing narratives first
+        existing_narratives = await get_existing_narratives(db, target_date, org_id)
+        if existing_narratives:
+            logger.info(f"Returning {len(existing_narratives)} existing narratives")
+            return NewsFeed(articles=existing_narratives)
+            
+        # If no existing narratives, proceed with generation
         all_articles = []
         
         # Initialize dynamic analysis service
@@ -1073,15 +1135,6 @@ async def get_news_feed(
                     scope = "this_week" if get_week_of_month(target_date) == get_week_of_month(datetime.now()) else "last_week"
                 else:  # monthly
                     scope = "last_month" if target_date.day <= 15 else "month_to_date"
-                
-                # Check existing articles if not in DEV mode
-                existing_articles = None
-                existing_articles = await check_existing_feed(db, org_id, target_date, period)
-                
-                if existing_articles:
-                    logger.info(f"Found existing {period} feed")
-                    all_articles.extend(existing_articles)
-                    continue
                 
                 # Get period-specific data using dynamic analysis
                 period_data = await analysis_service.analyze_metrics(
@@ -1123,7 +1176,7 @@ async def get_news_feed(
 
                         for article in new_articles:
                             article.time_period = f"{period} ({display_text})"
-                            article.context = context  # Add new context field
+                            article.context = context
 
                             # Create source info for metrics in the article
                             used_sources = set()
@@ -1169,8 +1222,6 @@ async def get_news_feed(
                                         sources=relevant_sources,
                                         metrics_by_source=metrics_by_source
                                     )
-
-                        store_articles(db, new_articles, target_date, org_id)
                         
                         all_articles.extend(new_articles)
                         logger.info(f"Generated {len(new_articles)} articles for {period} period")
@@ -1192,7 +1243,10 @@ async def get_news_feed(
                 )
             ])
         
-        # Sort articles by priority (daily first, then weekly, then monthly)
+        # Store all generated articles for future use
+        store_articles(db, all_articles, target_date, org_id)
+        
+        # Sort articles by priority
         all_articles.sort(
             key=lambda x: periods.index(x.time_period.split()[0])
         )
@@ -1992,7 +2046,7 @@ async def get_article_suggested_questions(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Generate suggested questions using GPT based on article content and metrics.
+    Get or generate suggested questions for an article.
     """
     try:
         # Validate user
@@ -2009,8 +2063,8 @@ async def get_article_suggested_questions(
                 detail=f"Article not found with ID: {article_id}"
             )
 
-        # Check for cached questions first
-        if article.suggested_questions:
+        # Check for cached questions - make sure to handle None case
+        if article.suggested_questions and isinstance(article.suggested_questions, list):
             logger.info(f"Returning cached questions for article {article_id}")
             return article.suggested_questions
 
@@ -2120,9 +2174,22 @@ Format your response as a JSON array of strings, each string being a question.""
             unique_questions = list(dict.fromkeys(all_questions))
             final_questions = unique_questions[:5]
 
-            # Cache the questions
-            article.suggested_questions = final_questions
-            db.commit()
+            # Store the questions as a proper JSON array
+            try:
+                # Begin a nested transaction
+                db.begin_nested()
+                
+                # Update the article with the new questions
+                article.suggested_questions = final_questions
+                
+                # Commit the nested transaction
+                db.commit()
+                
+                logger.info(f"Successfully stored {len(final_questions)} questions for article {article_id}")
+            except Exception as db_error:
+                db.rollback()
+                logger.error(f"Database error storing questions: {str(db_error)}")
+                # Continue execution to at least return the questions even if storage failed
             
             return final_questions
 
@@ -2136,18 +2203,36 @@ Format your response as a JSON array of strings, each string being a question.""
                 "What further analysis is needed?"
             ]
             
-            # Cache fallback questions
-            article.suggested_questions = fallback_questions
-            db.commit()
+            # Store fallback questions
+            try:
+                db.begin_nested()
+                article.suggested_questions = fallback_questions
+                db.commit()
+                logger.info(f"Stored fallback questions for article {article_id}")
+            except Exception as db_error:
+                db.rollback()
+                logger.error(f"Database error storing fallback questions: {str(db_error)}")
             
             return fallback_questions
 
     except Exception as e:
         logger.exception(f"Error generating article questions: {str(e)}")
-        return [
+        default_questions = [
             "What insights can we draw?",
             "What actions should we take?",
             "How does this impact strategy?",
             "Who needs to know this?",
             "What additional data needed?"
         ]
+        
+        # Try to store default questions
+        try:
+            db.begin_nested()
+            article.suggested_questions = default_questions
+            db.commit()
+            logger.info(f"Stored default questions for article {article_id}")
+        except Exception as db_error:
+            db.rollback()
+            logger.error(f"Database error storing default questions: {str(db_error)}")
+            
+        return default_questions
