@@ -5,6 +5,7 @@ from app.connectors.postgresql_connector import PostgreSQLConnector
 from app.connectors.google_sheets_connector import GoogleSheetsConnector
 from app.connectors.salesforce_connector import SalesforceConnector
 from app.connectors.snowflake_connector import SnowflakeConnector
+from app.connectors.mssql_connector import MSSQLConnector
 
 class ConnectorFactory:
     @staticmethod
@@ -23,6 +24,14 @@ class ConnectorFactory:
                 password=kwargs.get('password'),
                 database=kwargs.get('database'),
                 port=kwargs.get('port', 5432)
+            )
+        elif connector_type == 'mssql':
+            return MSSQLConnector(
+                host=kwargs.get('host'),
+                username=kwargs.get('username') or kwargs.get('user'),
+                password=kwargs.get('password'),
+                database=kwargs.get('database'),
+                port=kwargs.get('port', 1433)
             )
         elif connector_type == 'google_sheets':
             return GoogleSheetsConnector(

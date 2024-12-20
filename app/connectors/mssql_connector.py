@@ -1,64 +1,54 @@
-# connectors/postgresql_connector.py
+# connectors/mssql_connector.py
 
-import psycopg2
-import psycopg2.extras
-from app.connectors.base import BaseConnector
+import pyodbc
 import logging
-import os
+from app.connectors.base import BaseConnector
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class PostgreSQLConnector(BaseConnector):
-    def __init__(self, host, username, password, database, port=5432):
+class MSSQLConnector(BaseConnector):
+    def __init__(self, host, username, password, database, port=1433):
         super().__init__()  # Call parent constructor
-        self.source_type = 'postgresql'  # Set the source type
+        self.source_type = 'mssql'  # Set the source type
         self.host = host
         self.username = username
         self.password = password
         self.database = database
-        self.port = int(port) if port else 5432
+        self.port = int(port) if port else 1433
         self.connection = None
-        self.schema = 'public'
-        self.sslmode = os.getenv('POSTGRES_SSLMODE', 'prefer')
+        self.driver = '{ODBC Driver 18 for SQL Server}'  # Default driver
 
     def connect(self):
-        """Establish connection to PostgreSQL with error handling."""
+        """Establish connection to MSSQL with error handling."""
         try:
-            logger.info(f"Attempting to connect to PostgreSQL database {self.database} as user {self.username}")
-            self.connection = psycopg2.connect(
-                host=self.host,
-                user=self.username,
-                password=self.password,
-                dbname=self.database,
-                port=self.port,
-                sslmode=self.sslmode,
-                connect_timeout=10
+            logger.info(f"Attempting to connect to MSSQL database {self.database} as user {self.username}")
+            connection_string = (
+                f"DRIVER={self.driver};"
+                f"SERVER={self.host};"
+                f"DATABASE={self.database};"
+                f"UID={self.username};"
+                f"PWD={self.password};"
+                "TrustServerCertificate=yes;"
+                "Connect Timeout=30;" 
+                "LoginTimeout=30;"   
             )
-            # Test connection immediately
-            with self.connection.cursor() as cursor:
-                cursor.execute('SELECT 1')
-                cursor.fetchone()
-            logger.info("Successfully connected to PostgreSQL")
             
-        except psycopg2.OperationalError as e:
-            logger.error(f"PostgreSQL connection error: {str(e)}")
-            # Clean up the connection if it was created
+            self.connection = pyodbc.connect(connection_string)
+            logger.info("Successfully connected to MSSQL")
+            
+        except pyodbc.Error as e:
+            logger.error(f"MSSQL connection error: {str(e)}")
             if self.connection:
                 self.connection.close()
                 self.connection = None
-            if "authentication failed" in str(e):
+                
+            if "Login failed" in str(e):
                 raise ValueError(f"Authentication failed for user '{self.username}'. Please verify credentials.")
-            elif "could not connect to server" in str(e):
+            elif "Could not connect to server" in str(e):
                 raise ValueError(f"Could not connect to database server at {self.host}:{self.port}. Please verify connection details.")
             else:
                 raise ValueError(f"Database connection failed: {str(e)}")
-        except Exception as e:
-            logger.error(f"Unexpected error during PostgreSQL connection: {str(e)}")
-            if self.connection:
-                self.connection.close()
-                self.connection = None
-            raise ValueError(f"Failed to establish database connection: {str(e)}")
 
     def disconnect(self):
         """Safely close the connection."""
@@ -66,9 +56,9 @@ class PostgreSQLConnector(BaseConnector):
             if self.connection:
                 self.connection.close()
                 self.connection = None
-                logger.info("PostgreSQL connection closed")
+                logger.info("MSSQL connection closed")
         except Exception as e:
-            logger.error(f"Error closing PostgreSQL connection: {str(e)}")
+            logger.error(f"Error closing MSSQL connection: {str(e)}")
 
     def query(self, query_string, params=None):
         """Execute query with error handling and automatic reconnection."""
@@ -76,18 +66,28 @@ class PostgreSQLConnector(BaseConnector):
             self.connect()
         
         try:
-            with self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor = self.connection.cursor()  # Get cursor from our mocked connection
+            
+            # Execute query with or without parameters
+            if params:
                 cursor.execute(query_string, params)
-                return cursor.fetchall()
+            else:
+                cursor.execute(query_string)
                 
-        except psycopg2.OperationalError as e:
-            logger.error(f"PostgreSQL operational error: {str(e)}")
-            # Try to reconnect once
-            self.connect()
-            with self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
-                cursor.execute(query_string, params)
-                return cursor.fetchall()
+            # Only try to get column names if we have results
+            if cursor.description:
+                columns = [column[0] for column in cursor.description]
+                rows = cursor.fetchall()
                 
+                # Convert rows to dictionaries
+                result = []
+                for row in rows:
+                    row_dict = dict(zip(columns, row))
+                    result.append(row_dict)
+                return result
+                
+            return []
+                    
         except Exception as e:
             logger.error(f"Query execution failed: {str(e)}")
             logger.error(f"Query: {query_string}")
@@ -99,9 +99,9 @@ class PostgreSQLConnector(BaseConnector):
         try:
             with self.connection.cursor() as cursor:
                 columns = ', '.join(data.keys())
-                values = ', '.join(['%s'] * len(data))
-                query = f"INSERT INTO {table} ({columns}) VALUES ({values})"
-                cursor.execute(query, tuple(data.values()))
+                placeholders = ', '.join(['?' for _ in data])
+                query = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
+                cursor.execute(query, list(data.values()))
             self.connection.commit()
         except Exception as e:
             self.connection.rollback()
@@ -112,9 +112,9 @@ class PostgreSQLConnector(BaseConnector):
         """Update data with error handling."""
         try:
             with self.connection.cursor() as cursor:
-                set_clause = ', '.join([f"{k} = %s" for k in data.keys()])
+                set_clause = ', '.join([f"{k} = ?" for k in data.keys()])
                 query = f"UPDATE {table} SET {set_clause} WHERE {condition}"
-                cursor.execute(query, tuple(data.values()))
+                cursor.execute(query, list(data.values()))
             self.connection.commit()
         except Exception as e:
             self.connection.rollback()

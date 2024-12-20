@@ -1,3 +1,5 @@
+# connectors/mysql_connector.py
+
 import mysql.connector
 from app.connectors.base import BaseConnector
 import logging
