@@ -13,7 +13,6 @@ from app.schemas.schemas import DataSourceConnection, DataSourceConnectionRespon
 import logging 
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
-from sqlalchemy.sql import text
 from app.utils.database import get_db
 from openai import OpenAI
 import os
@@ -560,17 +559,13 @@ async def connect_to_data_source(
             if 'port' not in connector_params or not connector_params['port']:
                 connector_params['port'] = 5432
 
-            # Log connection attempt (excluding sensitive data)
-            log_params = {
-                k: v if k != 'password' else '****' 
-                for k, v in connector_params.items()
-            }
+            # Log connection parameters (excluding password)
+            log_params = {k: v if k != 'password' else '****' for k, v in connector_params.items()}
             logger.info(f"PostgreSQL connection parameters: {log_params}")
 
             # Verify required parameters
             required_params = ['host', 'username', 'password', 'database']
-            missing_params = [param for param in required_params 
-                            if param not in connector_params or not connector_params[param]]
+            missing_params = [param for param in required_params if param not in connector_params or not connector_params[param]]
             
             if missing_params:
                 raise ValueError(f"Missing required connection parameters: {', '.join(missing_params)}")
@@ -650,105 +645,44 @@ async def remove_data_source(
 ):
     try:
         org_id = current_user["current_org_id"]
-        logger.info(f"Attempting to delete connection {connection_id} for organization {org_id}")
-
-        # First, check if the connection exists using raw SQL to avoid SQLAlchemy mapping issues
-        connection_query = text("""
-            SELECT id, organization_id 
-            FROM data_source_connections 
-            WHERE id = :connection_id 
-            AND organization_id = :org_id
-        """)
-        connection = db.execute(
-            connection_query, 
-            {"connection_id": connection_id, "org_id": org_id}
+        
+        # Find and delete the connection
+        connection = db.query(models.DataSourceConnection).filter(
+            models.DataSourceConnection.id == connection_id,
+            models.DataSourceConnection.organization_id == org_id
         ).first()
-
+        
         if not connection:
             raise HTTPException(status_code=404, detail="Connection not found")
-
-        try:
-            # Check if table exists and delete in one transaction
-            delete_analytics_query = text("""
-                DO $$ 
-                BEGIN 
-                    IF EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_schema = 'public' 
-                        AND table_name = 'analytics_configurations'
-                    ) THEN 
-                        DELETE FROM analytics_configurations 
-                        WHERE connection_id = :connection_id;
-                    END IF;
-                END $$;
-            """)
-            db.execute(delete_analytics_query, {"connection_id": connection_id})
-            logger.info("Analytics configurations check and delete completed")
-        except Exception as e:
-            logger.warning(f"Error handling analytics configurations: {str(e)}")
-            # Continue with the deletion process
-
-        # Delete associated metrics using raw SQL
-        metrics_query = text("""
-            DELETE FROM metric_definitions 
-            WHERE connection_id = :connection_id 
-            RETURNING id
-        """)
-        deleted_metrics = db.execute(metrics_query, {"connection_id": connection_id})
-        metrics_count = len(list(deleted_metrics))
-        logger.info(f"Deleted {metrics_count} associated metrics")
-
-        # Delete the connection using raw SQL
-        delete_connection_query = text("""
-            DELETE FROM data_source_connections 
-            WHERE id = :connection_id 
-            AND organization_id = :org_id
-        """)
-        db.execute(delete_connection_query, {
-            "connection_id": connection_id,
-            "org_id": org_id
-        })
-
-        # Check remaining connections using raw SQL
-        remaining_query = text("""
-            SELECT COUNT(*) 
-            FROM data_source_connections 
-            WHERE organization_id = :org_id
-        """)
-        remaining_connections = db.execute(
-            remaining_query, 
-            {"org_id": org_id}
-        ).scalar()
-
+            
+        # Delete associated metrics
+        db.query(models.MetricDefinition).filter(
+            models.MetricDefinition.connection_id == connection_id
+        ).delete()
+        
+        # Delete the connection
+        db.delete(connection)
+        
+        # Check if this was the last connection
+        remaining_connections = db.query(models.DataSourceConnection).filter(
+            models.DataSourceConnection.organization_id == org_id
+        ).count()
+        
         if remaining_connections == 0:
-            # Update organization status using raw SQL
-            update_org_query = text("""
-                UPDATE organizations 
-                SET data_source_connected = false 
-                WHERE id = :org_id
-            """)
-            db.execute(update_org_query, {"org_id": org_id})
-            logger.info(f"Updated organization {org_id} data_source_connected to False")
-
-        return {
-            "message": "Data source removed successfully",
-            "connection_id": connection_id,
-            "remaining_connections": remaining_connections
-        }
-
+            # Update organization status
+            org = db.query(Organization).filter(Organization.id == org_id).first()
+            org.data_source_connected = False
+        
+        db.commit()
+        
+        return {"message": "Data source removed successfully"}
+        
     except HTTPException as he:
         raise he
     except Exception as e:
         logger.error(f"Error removing data source: {str(e)}")
-        # Try to rollback if possible
-        try:
-            db.rollback()
-        except:
-            pass
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to remove data source"
-        )
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/organization/{org_id}/data-sources")
 async def list_organization_data_sources(
