@@ -652,13 +652,14 @@ async def remove_data_source(
         org_id = current_user["current_org_id"]
         logger.info(f"Attempting to delete connection {connection_id} for organization {org_id}")
 
-        # First, check if the connection exists using raw SQL to avoid SQLAlchemy mapping issues
         connection_query = text("""
             SELECT id, organization_id 
             FROM data_source_connections 
             WHERE id = :connection_id 
             AND organization_id = :org_id
+            FOR UPDATE
         """)
+        
         connection = db.execute(
             connection_query, 
             {"connection_id": connection_id, "org_id": org_id}
@@ -668,7 +669,6 @@ async def remove_data_source(
             raise HTTPException(status_code=404, detail="Connection not found")
 
         try:
-            # Check if table exists and delete in one transaction
             delete_analytics_query = text("""
                 DO $$ 
                 BEGIN 
@@ -683,68 +683,67 @@ async def remove_data_source(
                 END $$;
             """)
             db.execute(delete_analytics_query, {"connection_id": connection_id})
-            logger.info("Analytics configurations check and delete completed")
-        except Exception as e:
-            logger.warning(f"Error handling analytics configurations: {str(e)}")
-            # Continue with the deletion process
+            db.commit()
+            logger.info("Analytics configurations deleted")
 
-        # Delete associated metrics using raw SQL
-        metrics_query = text("""
-            DELETE FROM metric_definitions 
-            WHERE connection_id = :connection_id 
-            RETURNING id
-        """)
-        deleted_metrics = db.execute(metrics_query, {"connection_id": connection_id})
-        metrics_count = len(list(deleted_metrics))
-        logger.info(f"Deleted {metrics_count} associated metrics")
-
-        # Delete the connection using raw SQL
-        delete_connection_query = text("""
-            DELETE FROM data_source_connections 
-            WHERE id = :connection_id 
-            AND organization_id = :org_id
-        """)
-        db.execute(delete_connection_query, {
-            "connection_id": connection_id,
-            "org_id": org_id
-        })
-
-        # Check remaining connections using raw SQL
-        remaining_query = text("""
-            SELECT COUNT(*) 
-            FROM data_source_connections 
-            WHERE organization_id = :org_id
-        """)
-        remaining_connections = db.execute(
-            remaining_query, 
-            {"org_id": org_id}
-        ).scalar()
-
-        if remaining_connections == 0:
-            # Update organization status using raw SQL
-            update_org_query = text("""
-                UPDATE organizations 
-                SET data_source_connected = false 
-                WHERE id = :org_id
+            metrics_query = text("""
+                DELETE FROM metric_definitions 
+                WHERE connection_id = :connection_id 
+                RETURNING id
             """)
-            db.execute(update_org_query, {"org_id": org_id})
-            logger.info(f"Updated organization {org_id} data_source_connected to False")
+            deleted_metrics = db.execute(metrics_query, {"connection_id": connection_id})
+            db.commit()
+            metrics_count = len(list(deleted_metrics))
+            logger.info(f"Deleted {metrics_count} associated metrics")
 
-        return {
-            "message": "Data source removed successfully",
-            "connection_id": connection_id,
-            "remaining_connections": remaining_connections
-        }
+            delete_connection_query = text("""
+                DELETE FROM data_source_connections 
+                WHERE id = :connection_id 
+                AND organization_id = :org_id
+            """)
+            db.execute(delete_connection_query, {
+                "connection_id": connection_id,
+                "org_id": org_id
+            })
+            db.commit()
+            logger.info("Data source connection deleted")
+
+            remaining_query = text("""
+                SELECT COUNT(*) 
+                FROM data_source_connections 
+                WHERE organization_id = :org_id
+            """)
+            remaining_connections = db.execute(
+                remaining_query, 
+                {"org_id": org_id}
+            ).scalar()
+
+            if remaining_connections == 0:
+                update_org_query = text("""
+                    UPDATE organizations 
+                    SET data_source_connected = false 
+                    WHERE id = :org_id
+                """)
+                db.execute(update_org_query, {"org_id": org_id})
+                db.commit()
+                logger.info(f"Updated organization status")
+
+            return {
+                "message": "Data source removed successfully",
+                "connection_id": connection_id,
+                "remaining_connections": remaining_connections
+            }
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error in deletion process: {str(e)}")
+            raise
 
     except HTTPException as he:
         raise he
     except Exception as e:
+        db.rollback()
         logger.error(f"Error removing data source: {str(e)}")
-        # Try to rollback if possible
-        try:
-            db.rollback()
-        except:
-            pass
         raise HTTPException(
             status_code=500,
             detail="Failed to remove data source"
