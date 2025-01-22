@@ -1,3 +1,5 @@
+
+
 # routers/data_source.py
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -669,22 +671,6 @@ async def remove_data_source(
             raise HTTPException(status_code=404, detail="Connection not found")
 
         try:
-            delete_analytics_query = text("""
-                DO $$ 
-                BEGIN 
-                    IF EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_schema = 'public' 
-                        AND table_name = 'analytics_configurations'
-                    ) THEN 
-                        DELETE FROM analytics_configurations 
-                        WHERE connection_id = :connection_id;
-                    END IF;
-                END $$;
-            """)
-            db.execute(delete_analytics_query, {"connection_id": connection_id})
-            db.commit()
-            logger.info("Analytics configurations deleted")
 
             metrics_query = text("""
                 DELETE FROM metric_definitions 

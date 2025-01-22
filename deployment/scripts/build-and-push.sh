@@ -25,7 +25,7 @@ docker buildx build \
     --build-arg DB_PORT=$DB_PORT \
     --build-arg DB_NAME=$DB_NAME \
     --build-arg DB_NAME=$DB_SSLMODE \
-    -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$APP_NAME:latest \
+    -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$NARRATIVE_APP_NAME:latest \
     -f deployment/Dockerfile . || handle_error "Failed to build and push image"
 
 echo "Build and push complete!"
